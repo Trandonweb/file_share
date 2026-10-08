@@ -88,7 +88,7 @@ function removeUser(id){state.users.delete(id);renderUsers()}
 
 function connectTo(id,name){
   if(!id||id===state.peer.id||state.connections.has(id))return;
-  const c=state.peer.connect(id,{reliable:true,serialization:"raw"});
+  const c=state.peer.connect(id,{reliable:true,serialization:"binary"});
   setupConnection(c,name);
 }
 
@@ -201,7 +201,7 @@ function join(){
         state.joined=true;addUser(id,state.name);
         $("join").disabled=true;$("leave").disabled=false;
         setStatus("방에 연결하는 중...");
-        const c=p.connect(hostId,{reliable:true,serialization:"raw"});
+        const c=p.connect(hostId,{reliable:true,serialization:"binary"});
         setupConnection(c);
       });
       p.on("connection",c=>setupConnection(c));
