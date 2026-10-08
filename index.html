@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>File Share</title>
+<style>
+:root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17191c;background:#f5f7fa}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;justify-content:center;padding:32px 16px}
+.wrap{width:min(920px,100%)}.card{background:white;border:1px solid #e1e5ea;border-radius:20px;padding:28px;box-shadow:0 10px 35px #0000000b}
+h1{margin:0 0 7px;font-size:30px}p{color:#69717c}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:22px}
+label{font-size:13px;font-weight:700;display:block;margin-bottom:7px}input,button{font:inherit}input{width:100%;border:1px solid #d6dbe1;border-radius:11px;padding:12px;background:#fff}
+button{border:0;border-radius:11px;padding:12px 16px;font-weight:700;cursor:pointer;background:#17191c;color:#fff}button.secondary{background:#eef1f4;color:#222}button:disabled{opacity:.45;cursor:not-allowed}
+.actions{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}.status{margin-top:18px;padding:12px 14px;border-radius:11px;background:#f1f4f7;color:#4c5560;font-size:14px}
+.section{margin-top:25px;border-top:1px solid #eceff2;padding-top:22px}.section h2{font-size:18px;margin:0 0 13px}
+.users{display:flex;gap:8px;flex-wrap:wrap}.user{padding:8px 11px;border-radius:999px;background:#f0f2f5;font-size:13px}.user.me{background:#e6f6ed}
+.drop{border:2px dashed #cfd5dc;border-radius:15px;padding:28px;text-align:center;transition:.15s}.drop.drag{border-color:#222;background:#f7f8f9}
+.filelist{margin-top:12px;display:grid;gap:8px}.file{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 13px;background:#f7f8fa;border-radius:11px}.file small{color:#707985}
+.progress{height:6px;background:#e9edf0;border-radius:10px;overflow:hidden;margin-top:10px}.progress>i{display:block;height:100%;width:0;background:#222}
+.note{font-size:12px;color:#7a838e;line-height:1.6;margin-top:16px}
+@media(max-width:650px){.grid{grid-template-columns:1fr}.card{padding:20px}}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<h1>File Share</h1>
+<p>같은 방에 현재 접속 중인 사람끼리 파일을 직접 공유합니다.</p>
+
+<div class="grid">
+  <div><label for="name">닉네임</label><input id="name" maxlength="24" placeholder="예: Trandon"></div>
+  <div><label for="room">방 코드</label><input id="room" maxlength="32" placeholder="예: 2026club"></div>
+</div>
+<div class="actions">
+  <button id="join">방 입장</button>
+  <button id="leave" class="secondary" disabled>나가기</button>
+</div>
+<div id="status" class="status">방에 입장하면 접속 중인 사용자가 표시됩니다.</div>
+
+<div class="section">
+<h2>접속 중인 사용자</h2><div id="users" class="users"><span class="user">아직 없음</span></div>
+</div>
+
+<div class="section">
+<h2>파일 보내기</h2>
+<div id="drop" class="drop">
+  <strong>파일을 여기에 끌어놓거나</strong><br><br>
+  <button id="pick" class="secondary">파일 선택</button>
+  <input id="fileInput" type="file" hidden multiple>
+  <div class="note">파일 내용은 서버에 업로드되지 않고 WebRTC로 상대 기기에 직접 전송됩니다.</div>
+</div>
+<div id="sendList" class="filelist"></div>
+</div>
+
+<div class="section">
+<h2>받은 파일</h2><div id="receiveList" class="filelist"></div>
+</div>
+</div></div>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const state={peer:null,room:"",name:"",host:false,connections:new Map(),users:new Map(),joined:false};
+const CHUNK=64*1024;
+
+function setStatus(t){$("status").textContent=t}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function cleanRoom(s){return s.trim().toLowerCase().replace(/[^a-z0-9_-]/g,"").slice(0,32)}
+function roomPeerId(room){return "fs-room-"+room}
+function randomId(){return Math.random().toString(36).slice(2,10)}
+function fmt(n){if(n<1024)return n+" B";let u=["KB","MB","GB"];let i=-1;do{n/=1024;i++}while(n>=1024&&i<u.length-1);return n.toFixed(n>=100?0:1)+" "+u[i]}
+
+function renderUsers(){
+  const arr=[...state.users.values()];
+  $("users").innerHTML=arr.length?arr.map(u=>'<span class="user '+(u.id===state.peer?.id?"me":"")+'">'+esc(u.name)+(u.id===state.peer?.id?" (나)":"")+'</span>').join(""):'<span class="user">아직 없음</span>';
+}
+
+function broadcast(msg, except){
+  for(const [id,c] of state.connections){if(id!==except&&c.open) c.send(msg)}
+}
+
+function sendPresence(){
+  const me={type:"presence",id:state.peer.id,name:state.name};
+  broadcast(me);
+}
+
+function addUser(id,name){state.users.set(id,{id,name});renderUsers()}
+function removeUser(id){state.users.delete(id);renderUsers()}
+
+function connectTo(id,name){
+  if(!id||id===state.peer.id||state.connections.has(id))return;
+  const c=state.peer.connect(id,{reliable:true,serialization:"raw"});
+  setupConnection(c,name);
+}
+
+function setupConnection(c,knownName){
+  state.connections.set(c.peer,c);
+  c.on("open",()=>{
+    c.send({type:"hello",id:state.peer.id,name:state.name,known:knownName||""});
+    sendPresence();
+  });
+  c.on("data",data=>handleData(c,data));
+  c.on("close",()=>{state.connections.delete(c.peer);removeUser(c.peer);broadcast({type:"left",id:c.peer},c.peer)});
+  c.on("error",()=>{state.connections.delete(c.peer);removeUser(c.peer)});
+}
+
+state.incoming={};
+
+function handleData(c,data){
+  if(data instanceof ArrayBuffer || data instanceof Blob)return;
+  if(!data||typeof data!=="object")return;
+  if(data.type==="hello"){
+    addUser(data.id,data.name);
+    c.send({type:"roster",users:[...state.users.values()]});
+    broadcast({type:"presence",id:data.id,name:data.name},c.peer);
+  }else if(data.type==="roster"){
+    for(const u of data.users)addUser(u.id,u.name);
+  }else if(data.type==="presence"){
+    addUser(data.id,data.name);
+    if(data.id!==state.peer.id&&!state.connections.has(data.id))connectTo(data.id,data.name);
+  }else if(data.type==="left"){
+    removeUser(data.id);
+  }else if(data.type==="file-start"){
+    state.incoming[data.transferId]={name:data.name,size:data.size,type:data.mime,parts:[],received:0,from:c.peer};
+    renderReceive(data.transferId,data.name,0,data.size);
+  }else if(data.type==="file-chunk"){
+    const t=state.incoming[data.transferId]; if(!t)return;
+    t.parts.push(data.chunk);t.received+=data.chunk.byteLength||data.chunk.size||0;
+    renderReceive(data.transferId,t.name,t.received,t.size);
+  }else if(data.type==="file-end"){
+    const t=state.incoming[data.transferId];if(!t)return;
+    const blob=new Blob(t.parts,{type:t.type||"application/octet-stream"});
+    addReceivedFile(t.name,blob);
+    delete state.incoming[data.transferId];
+  }
+}
+
+function renderReceive(id,name,received,size){
+  let el=document.querySelector('[data-transfer="'+id+'"]');
+  if(!el){el=document.createElement("div");el.className="file";el.dataset.transfer=id;el.innerHTML='<div><strong></strong><small></small><div class="progress"><i></i></div></div>';$("receiveList").prepend(el)}
+  el.querySelector("strong").textContent=name;
+  el.querySelector("small").textContent=" "+fmt(received)+" / "+fmt(size);
+  el.querySelector("i").style.width=(size?Math.min(100,received/size*100):0)+"%";
+}
+
+function addReceivedFile(name,blob){
+  const el=document.createElement("div");el.className="file";
+  const a=document.createElement("a");a.download=name;a.href=URL.createObjectURL(blob);a.textContent=name;a.style.color="inherit";a.style.fontWeight="700";
+  const s=document.createElement("small");s.textContent=fmt(blob.size);
+  el.append(a,s);$("receiveList").prepend(el);
+}
+
+async function sendFile(file){
+  const targets=[...state.connections.values()].filter(c=>c.open);
+  if(!targets.length){setStatus("보낼 상대가 없습니다. 같은 방에 다른 사용자가 접속해 있는지 확인하세요.");return}
+  const id=randomId()+"-"+Date.now();
+  const row=document.createElement("div");row.className="file";
+  row.innerHTML='<div><strong>'+esc(file.name)+'</strong><small> 전송 중 · 0%</small><div class="progress"><i></i></div></div>';
+  $("sendList").prepend(row);
+  for(const c of targets)c.send({type:"file-start",transferId:id,name:file.name,size:file.size,mime:file.type});
+  let offset=0;
+  while(offset<file.size){
+    const buf=await file.slice(offset,offset+CHUNK).arrayBuffer();
+    for(const c of targets)if(c.open)c.send({type:"file-chunk",transferId:id,chunk:buf});
+    offset+=buf.byteLength;
+    const pct=file.size?Math.round(offset/file.size*100):100;
+    row.querySelector("small").textContent=" 전송 중 · "+pct+"%";
+    row.querySelector("i").style.width=pct+"%";
+    await new Promise(r=>setTimeout(r,0));
+  }
+  for(const c of targets)if(c.open)c.send({type:"file-end",transferId:id});
+  row.querySelector("small").textContent=" 전송 완료 · "+fmt(file.size);
+}
+
+function chooseFiles(files){[...files].forEach(sendFile)}
+
+function join(){
+  if(state.joined)return;
+  const name=$("name").value.trim().slice(0,24),room=cleanRoom($("room").value);
+  if(!name||!room){setStatus("닉네임과 방 코드를 입력하세요.");return}
+  state.name=name;state.room=room;
+  localStorage.setItem("fs-name",name);
+  localStorage.setItem("fs-room",room);
+  const hostId=roomPeerId(room);
+  const peerId=hostId;
+  const peer=new Peer(peerId,{debug:0});
+  state.peer=peer;
+  peer.on("open",id=>{
+    state.joined=true;state.host=true;
+    addUser(id,state.name);
+    $("join").disabled=true;$("leave").disabled=false;
+    setStatus("방 생성 완료. 다른 사람에게 방 코드를 알려주세요.");
+  });
+  peer.on("connection",c=>setupConnection(c));
+  peer.on("error",err=>{
+    if(err.type==="unavailable-id"){
+      // Deterministic room host is already running; become a participant.
+      peer.destroy();
+      const p=new Peer(randomId()+"-"+Date.now(),{debug:0});
+      state.peer=p;state.host=false;
+      p.on("open",id=>{
+        state.joined=true;addUser(id,state.name);
+        $("join").disabled=true;$("leave").disabled=false;
+        setStatus("방에 연결하는 중...");
+        const c=p.connect(hostId,{reliable:true,serialization:"raw"});
+        setupConnection(c);
+      });
+      p.on("connection",c=>setupConnection(c));
+      p.on("error",e=>setStatus("연결 오류: "+e.message));
+    }else setStatus("연결 오류: "+(err.message||err.type));
+  });
+}
+
+function leave(){
+  if(!state.peer)return;
+  state.connections.forEach(c=>c.close());state.connections.clear();
+  state.peer.destroy();state.peer=null;state.users.clear();state.joined=false;state.host=false;
+  $("join").disabled=false;$("leave").disabled=true;renderUsers();
+  setStatus("방에서 나왔습니다.");
+}
+
+$("join").onclick=join;$("leave").onclick=leave;
+$("pick").onclick=()=>$("fileInput").click();
+$("fileInput").onchange=e=>chooseFiles(e.target.files);
+$("drop").ondragover=e=>{e.preventDefault();$("drop").classList.add("drag")};
+$("drop").ondragleave=()=>$("drop").classList.remove("drag");
+$("drop").ondrop=e=>{e.preventDefault();$("drop").classList.remove("drag");chooseFiles(e.dataTransfer.files)};
+$("name").value=localStorage.getItem("fs-name")||"";
+$("room").value=localStorage.getItem("fs-room")||"";
+window.addEventListener("beforeunload",leave);
+</script>
+</body>
+</html>
